@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <string>
 #include <cstring>
+#include <fstream>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -52,8 +53,39 @@ int main(int argc, char **argv) {
 
   // Uncomment the code below to pass the first stage
   // 
-  // accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
-  // std::cout << "Client connected\n";
+  int client_fd = accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
+  if (client_fd < 0) {
+    std::cerr << "Failed to accept client connection\n";
+    return 1;
+  }
+
+  std::cout << "Client connected\n";
+
+  const size_t BUFFER_SIZE = 1024;
+  char buffer[BUFFER_SIZE];
+
+  while (true) {
+    ssize_t bytesRead = read(client_fd, buffer, BUFFER_SIZE);
+    
+    if (bytesRead == -1) {
+        perror("Error reading from file descriptor");
+        break;
+    } else if (bytesRead == 0) {
+        std::cout << "End of file reached." << std::endl;
+        break;
+    } else {
+        // Process read data (buffer is NOT null-terminated by read)
+        std::cout.write(buffer, bytesRead);
+    }
+
+     // Regardless of the message send back pong
+    std::string response = "+PONG\r\n";
+    send(client_fd, response.c_str(), response.size(), 0);
+  }
+
+
+ 
+  
   // 
   // close(server_fd);
 
