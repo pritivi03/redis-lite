@@ -286,7 +286,7 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
   }
 
   if (iequals(args[0], "rpush")) {
-    if (args.size() != 3) {
+    if (args.size() < 3) {
       send_all(client_fd,
                "-ERR wrong number of arguments for 'rpush' command\r\n");
       return;
@@ -296,7 +296,9 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
     {
       std::lock_guard<std::mutex> lock(kv_store_mutex);
       auto &lst = list_store[args[1]];
-      lst.push_back(args[2]);
+      for (size_t i = 2; i < args.size(); ++i) {
+        lst.push_back(args[i]);
+      }
       list_size = static_cast<int64_t>(lst.size());
     }
 
