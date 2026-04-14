@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -18,8 +19,19 @@
 
 namespace {
 
-std::unordered_map<std::string, std::string> kv_store;
+struct Entry {
+  std::string value;
+  std::optional<int64_t> expiry_at_ms; // absolute time, nullopt = no expiry
+};
+
+std::unordered_map<std::string, Entry> kv_store;
 std::mutex kv_store_mutex;
+
+int64_t now_ms() {
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(system_clock::now().time_since_epoch())
+      .count();
+}
 
 bool read_crlf_line(const std::string &s, size_t &pos, std::string &line) {
   size_t start = pos;
@@ -158,15 +170,35 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
   }
 
   if (iequals(args[0], "set")) {
-    if (args.size() != 3) {
+    if (args.size() != 3 && args.size() != 5) {
       send_all(client_fd,
                "-ERR wrong number of arguments for 'set' command\r\n");
       return;
     }
 
+    int64_t expiry_ms = -1;
+    if (args.size() == 5) {
+      std::string time_variant = args[3];
+      int64_t expiry_arg = stoi(args[4]);
+      if (time_variant == "EX") {
+        expiry_ms = now_ms() + (expiry_arg * 1000);
+      } else if (time_variant == "PX") {
+        expiry_ms = now_ms() + expiry_arg;
+      } else {
+        send_all(client_fd, "-ERR wrong time_variant for 'set' command\r\n");
+        return;
+      }
+    }
+
     {
       std::lock_guard<std::mutex> lock(kv_store_mutex);
-      kv_store[args[1]] = args[2];
+      std::string key = args[1];
+      std::string value = args[2];
+      if (expiry_ms != -1) {
+        kv_store[key] = Entry{value, expiry_ms};
+      } else {
+        kv_store[key] = Entry{value, std::nullopt};
+      }
     }
 
     send_all(client_fd, "+OK\r\n");
@@ -183,9 +215,17 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
     std::optional<std::string_view> val = std::nullopt;
     {
       std::lock_guard<std::mutex> lock(kv_store_mutex);
-      auto it = kv_store.find(args[1]);
+      std::string key = args[1];
+      auto it = kv_store.find(key);
       if (it != kv_store.end()) {
-        val = it->second;
+        Entry &entry = it->second;
+        if (now_ms() >= entry.expiry_at_ms) {
+          // This entry has expired - remove it - don't set val
+          kv_store.erase(key);
+        } else {
+          // Otherwise this entry is still valid
+          val = entry.value;
+        }
       }
     }
 
