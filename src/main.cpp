@@ -444,6 +444,35 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
     return;
   }
 
+  if (iequals(args[0], "lpop")) {
+    if (args.size() < 2) {
+      send_all(client_fd,
+               "-ERR wrong number of arguments for 'lpop' command\r\n");
+      return;
+    }
+
+    std::optional<std::string> popped;
+    {
+      std::lock_guard<std::mutex> lock(kv_store_mutex);
+      auto it = list_store.find(args[1]);
+      if (it != list_store.end() && !it->second.empty()) {
+        popped = std::move(it->second.front());
+        it->second.erase(it->second.begin());
+        if (it->second.empty()) {
+          list_store.erase(it);
+        }
+      }
+    }
+
+    if (!popped.has_value()) {
+      send_all(client_fd, encode_bulk_string(std::nullopt));
+    } else {
+      send_all(client_fd,
+               encode_bulk_string(std::optional<std::string_view>(*popped)));
+    }
+    return;
+  }
+
   send_all(client_fd, "-ERR unknown command '" + args[0] + "'\r\n");
 }
 
