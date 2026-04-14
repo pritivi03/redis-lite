@@ -26,6 +26,7 @@ struct Entry {
 };
 
 std::unordered_map<std::string, Entry> kv_store;
+std::unordered_map<std::string, std::vector<std::string>> list_store;
 std::mutex kv_store_mutex;
 
 int64_t now_ms() {
@@ -159,6 +160,10 @@ std::string encode_bulk_string(const std::optional<std::string_view> payload) {
          std::string(*payload) + "\r\n";
 }
 
+std::string encode_integer(int64_t value) {
+  return ":" + std::to_string(value) + "\r\n";
+}
+
 bool iequals(const std::string &a, const std::string &b) {
   if (a.size() != b.size()) {
     return false;
@@ -277,6 +282,25 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
       return;
     }
     send_all(client_fd, encode_bulk_string(args[1]));
+    return;
+  }
+
+  if (iequals(args[0], "rpush")) {
+    if (args.size() != 3) {
+      send_all(client_fd,
+               "-ERR wrong number of arguments for 'rpush' command\r\n");
+      return;
+    }
+
+    int64_t list_size = 0;
+    {
+      std::lock_guard<std::mutex> lock(kv_store_mutex);
+      auto &lst = list_store[args[1]];
+      lst.push_back(args[2]);
+      list_size = static_cast<int64_t>(lst.size());
+    }
+
+    send_all(client_fd, encode_integer(list_size));
     return;
   }
 
