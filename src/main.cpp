@@ -78,7 +78,8 @@ bool parse_int64(const std::string &line, long long &out) {
   return true;
 }
 
-// Signed integer for command args (e.g. LRANGE start/stop: 0, negative indices).
+// Signed integer for command args (e.g. LRANGE start/stop: 0, negative
+// indices).
 bool parse_signed_int64(const std::string &s, int64_t &out) {
   long long parsed = 0;
   if (!parse_int64(s, parsed)) {
@@ -361,6 +362,27 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
     return;
   }
 
+  if (iequals(args[0], "lpush")) {
+    if (args.size() < 3) {
+      send_all(client_fd,
+               "-ERR wrong number of arguments for 'lpush' command\r\n");
+      return;
+    }
+
+    int64_t list_size = 0;
+    {
+      std::lock_guard<std::mutex> lock(kv_store_mutex);
+      auto &lst = list_store[args[1]];
+      for (size_t i = 2; i < args.size(); ++i) {
+        lst.insert(lst.begin(), args[i]);
+      }
+      list_size = static_cast<int64_t>(lst.size());
+    }
+
+    send_all(client_fd, encode_integer(list_size));
+    return;
+  }
+
   if (iequals(args[0], "lrange")) {
     if (args.size() != 4) {
       send_all(client_fd,
@@ -372,8 +394,7 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
     int64_t raw_end = 0;
     if (!parse_signed_int64(args[2], raw_start) ||
         !parse_signed_int64(args[3], raw_end)) {
-      send_all(client_fd,
-               "-ERR value is not an integer or out of range\r\n");
+      send_all(client_fd, "-ERR value is not an integer or out of range\r\n");
       return;
     }
 
