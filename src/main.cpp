@@ -93,6 +93,23 @@ bool parse_int64(const std::string &line, long long &out) {
   return true;
 }
 
+// Non-negative double for command args that accept fractional seconds (e.g.
+// BLPOP timeout).
+bool parse_nonneg_double(const std::string &s, double &out) {
+  if (s.empty())
+    return false;
+  try {
+    size_t idx = 0;
+    double val = std::stod(s, &idx);
+    if (idx != s.size() || val < 0.0)
+      return false;
+    out = val;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 // Signed integer for command args (e.g. LRANGE start/stop: 0, negative
 // indices).
 bool parse_signed_int64(const std::string &s, int64_t &out) {
@@ -570,16 +587,13 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
       return;
     }
 
-    // Last argument is the timeout in whole seconds (0 = block indefinitely).
-    int64_t timeout_secs = 0;
-    {
-      long long parsed = 0;
-      if (!parse_int64(args.back(), parsed) || parsed < 0) {
-        send_all(client_fd,
-                 "-ERR timeout is not an integer or out of range\r\n");
-        return;
-      }
-      timeout_secs = static_cast<int64_t>(parsed);
+    // Last argument is the timeout in seconds, may be fractional (0 = block
+    // indefinitely).
+    double timeout_secs = 0.0;
+    if (!parse_nonneg_double(args.back(), timeout_secs)) {
+      send_all(client_fd,
+               "-ERR timeout is not a float or out of range\r\n");
+      return;
     }
 
     const std::vector<std::string> keys(args.begin() + 1, args.end() - 1);
@@ -612,12 +626,12 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
 
     // Block until served or timed out.
     bool timed_out = false;
-    if (timeout_secs == 0) {
+    if (timeout_secs == 0.0) {
       waiter->cv.wait(lock, [&] { return waiter->done; });
     } else {
       auto deadline =
           std::chrono::steady_clock::now() +
-          std::chrono::seconds(timeout_secs);
+          std::chrono::duration<double>(timeout_secs);
       bool served =
           waiter->cv.wait_until(lock, deadline, [&] { return waiter->done; });
       if (!served)
