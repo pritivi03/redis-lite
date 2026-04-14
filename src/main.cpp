@@ -1,18 +1,25 @@
 #include <arpa/inet.h>
-#include <charconv>
 #include <cctype>
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <netdb.h>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 namespace {
+
+std::unordered_map<std::string, std::string> kv_store;
+std::mutex kv_store_mutex;
 
 bool read_crlf_line(const std::string &s, size_t &pos, std::string &line) {
   size_t start = pos;
@@ -69,7 +76,8 @@ bool parse_bulk_string(const std::string &s, size_t &pos, std::string &out) {
   return true;
 }
 
-// RESP arrays sent by redis-cli for commands are *-prefixed arrays of bulk strings.
+// RESP arrays sent by redis-cli for commands are *-prefixed arrays of bulk
+// strings.
 bool parse_array_of_bulk_strings(const std::string &s, size_t &pos,
                                  std::vector<std::string> &args) {
   if (pos >= s.size() || s[pos] != '*') {
@@ -109,9 +117,13 @@ void send_all(int fd, const std::string &data) {
   }
 }
 
-std::string bulk_reply(const std::string &payload) {
-  return std::string("$") + std::to_string(payload.size()) + "\r\n" + payload +
-         "\r\n";
+std::string encode_bulk_string(const std::optional<std::string_view> payload) {
+  if (!payload.has_value()) {
+    return "$-1\r\n";
+  }
+
+  return std::string("$") + std::to_string(payload->size()) + "\r\n" +
+         std::string(*payload) + "\r\n";
 }
 
 bool iequals(const std::string &a, const std::string &b) {
@@ -137,10 +149,47 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
     if (args.size() == 1) {
       send_all(client_fd, "+PONG\r\n");
     } else if (args.size() == 2) {
-      send_all(client_fd, bulk_reply(args[1]));
+      send_all(client_fd, encode_bulk_string(args[1]));
     } else {
-      send_all(client_fd, "-ERR wrong number of arguments for 'ping' command\r\n");
+      send_all(client_fd,
+               "-ERR wrong number of arguments for 'ping' command\r\n");
     }
+    return;
+  }
+
+  if (iequals(args[0], "set")) {
+    if (args.size() != 3) {
+      send_all(client_fd,
+               "-ERR wrong number of arguments for 'set' command\r\n");
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(kv_store_mutex);
+      kv_store[args[1]] = args[2];
+    }
+
+    send_all(client_fd, "+OK\r\n");
+    return;
+  }
+
+  if (iequals(args[0], "get")) {
+    if (args.size() != 2) {
+      send_all(client_fd,
+               "-ERR wrong number of arguments for 'get' command\r\n");
+      return;
+    }
+
+    std::optional<std::string_view> val = std::nullopt;
+    {
+      std::lock_guard<std::mutex> lock(kv_store_mutex);
+      auto it = kv_store.find(args[1]);
+      if (it != kv_store.end()) {
+        val = it->second;
+      }
+    }
+
+    send_all(client_fd, encode_bulk_string(val));
     return;
   }
 
@@ -150,7 +199,7 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
                "-ERR wrong number of arguments for 'echo' command\r\n");
       return;
     }
-    send_all(client_fd, bulk_reply(args[1]));
+    send_all(client_fd, encode_bulk_string(args[1]));
     return;
   }
 
