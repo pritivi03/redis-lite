@@ -4,9 +4,12 @@
 #include <charconv>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <netdb.h>
 #include <optional>
@@ -26,8 +29,19 @@ struct Entry {
   std::optional<int64_t> expiry_at_ms; // absolute time, nullopt = no expiry
 };
 
+// Waiter registered by a BLPOP call. Protected by kv_store_mutex.
+struct BlpopWaiter {
+  std::string matched_key;
+  std::string matched_value;
+  bool done = false;
+  std::condition_variable cv;
+};
+
 std::unordered_map<std::string, Entry> kv_store;
 std::unordered_map<std::string, std::vector<std::string>> list_store;
+// Per-key FIFO queue of clients blocked in BLPOP. Protected by kv_store_mutex.
+std::unordered_map<std::string, std::deque<std::shared_ptr<BlpopWaiter>>>
+    blpop_waiters;
 std::mutex kv_store_mutex;
 
 int64_t now_ms() {
@@ -220,6 +234,39 @@ std::string encode_array(const std::vector<std::string_view> &elements) {
   return out;
 }
 
+// Must be called with kv_store_mutex held. Serves as many BLPOP waiters on
+// `key` as there are elements in the list, in FIFO order.
+void notify_blpop_waiters(const std::string &key) {
+  auto wait_it = blpop_waiters.find(key);
+  if (wait_it == blpop_waiters.end())
+    return;
+
+  auto list_it = list_store.find(key);
+  if (list_it == list_store.end() || list_it->second.empty())
+    return;
+
+  auto &q = wait_it->second;
+  auto &lst = list_it->second;
+
+  while (!q.empty() && !lst.empty()) {
+    auto waiter = q.front();
+    q.pop_front();
+    if (waiter->done)
+      continue; // already served by another key or timed out
+
+    waiter->matched_key = key;
+    waiter->matched_value = std::move(lst.front());
+    lst.erase(lst.begin());
+    waiter->done = true;
+    waiter->cv.notify_one();
+  }
+
+  if (q.empty())
+    blpop_waiters.erase(key);
+  if (lst.empty())
+    list_store.erase(key);
+}
+
 bool iequals(const std::string &a, const std::string &b) {
   if (a.size() != b.size()) {
     return false;
@@ -356,6 +403,7 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
         lst.push_back(args[i]);
       }
       list_size = static_cast<int64_t>(lst.size());
+      notify_blpop_waiters(args[1]);
     }
 
     send_all(client_fd, encode_integer(list_size));
@@ -377,6 +425,7 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
         lst.insert(lst.begin(), args[i]);
       }
       list_size = static_cast<int64_t>(lst.size());
+      notify_blpop_waiters(args[1]);
     }
 
     send_all(client_fd, encode_integer(list_size));
@@ -510,6 +559,94 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
       views.push_back(s);
     }
     send_all(client_fd, encode_array(views));
+    return;
+  }
+
+  if (iequals(args[0], "blpop")) {
+    // Syntax: BLPOP key [key ...] timeout
+    if (args.size() < 3) {
+      send_all(client_fd,
+               "-ERR wrong number of arguments for 'blpop' command\r\n");
+      return;
+    }
+
+    // Last argument is the timeout in whole seconds (0 = block indefinitely).
+    int64_t timeout_secs = 0;
+    {
+      long long parsed = 0;
+      if (!parse_int64(args.back(), parsed) || parsed < 0) {
+        send_all(client_fd,
+                 "-ERR timeout is not an integer or out of range\r\n");
+        return;
+      }
+      timeout_secs = static_cast<int64_t>(parsed);
+    }
+
+    const std::vector<std::string> keys(args.begin() + 1, args.end() - 1);
+
+    std::unique_lock<std::mutex> lock(kv_store_mutex);
+
+    // If any key already has elements, serve immediately (first key wins).
+    for (const auto &key : keys) {
+      auto it = list_store.find(key);
+      if (it != list_store.end() && !it->second.empty()) {
+        std::string val = std::move(it->second.front());
+        it->second.erase(it->second.begin());
+        if (it->second.empty())
+          list_store.erase(it);
+        lock.unlock();
+
+        std::string resp = "*2\r\n";
+        resp += encode_bulk_string(std::string_view(key));
+        resp += encode_bulk_string(std::string_view(val));
+        send_all(client_fd, resp);
+        return;
+      }
+    }
+
+    // No elements yet — register as a waiter on every requested key.
+    auto waiter = std::make_shared<BlpopWaiter>();
+    for (const auto &key : keys) {
+      blpop_waiters[key].push_back(waiter);
+    }
+
+    // Block until served or timed out.
+    bool timed_out = false;
+    if (timeout_secs == 0) {
+      waiter->cv.wait(lock, [&] { return waiter->done; });
+    } else {
+      auto deadline =
+          std::chrono::steady_clock::now() +
+          std::chrono::seconds(timeout_secs);
+      bool served =
+          waiter->cv.wait_until(lock, deadline, [&] { return waiter->done; });
+      if (!served)
+        timed_out = true;
+    }
+
+    // Clean up: remove this waiter from all per-key queues (handles timeout
+    // and the case where we were registered on multiple keys but only one
+    // fired).
+    for (const auto &key : keys) {
+      auto wait_it = blpop_waiters.find(key);
+      if (wait_it == blpop_waiters.end())
+        continue;
+      auto &q = wait_it->second;
+      q.erase(std::remove(q.begin(), q.end(), waiter), q.end());
+      if (q.empty())
+        blpop_waiters.erase(key);
+    }
+
+    lock.unlock();
+
+    if (timed_out) {
+      send_all(client_fd, "*-1\r\n");
+    } else {
+      std::string resp = "*2\r\n";
+      resp += encode_bulk_string(std::string_view(waiter->matched_key));
+      resp += encode_bulk_string(std::string_view(waiter->matched_value));
+      send_all(client_fd, resp);
+    }
     return;
   }
 
