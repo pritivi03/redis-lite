@@ -383,6 +383,24 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
     return;
   }
 
+  if (iequals(args[0], "llen")) {
+    if (args.size() != 2) {
+      send_all(client_fd,
+               "-ERR wrong number of arguments for 'llen' command\r\n");
+      return;
+    }
+
+    std::string key = args[1];
+
+    int64_t list_size = 0;
+    if (list_store.find(key) != list_store.end()) {
+      list_size = list_store[key].size();
+    }
+
+    send_all(client_fd, encode_integer(list_size));
+    return;
+  }
+
   if (iequals(args[0], "lrange")) {
     if (args.size() != 4) {
       send_all(client_fd,
