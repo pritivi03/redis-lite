@@ -2,6 +2,7 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -31,6 +32,26 @@ int64_t now_ms() {
   using namespace std::chrono;
   return duration_cast<milliseconds>(system_clock::now().time_since_epoch())
       .count();
+}
+
+bool safe_add_int64(int64_t a, int64_t b, int64_t &out) {
+  if ((b > 0 && a > LLONG_MAX - b) || (b < 0 && a < LLONG_MIN - b)) {
+    return false;
+  }
+  out = a + b;
+  return true;
+}
+
+bool parse_positive_int64(const std::string &s, int64_t &out) {
+  const char *begin = s.data();
+  const char *end = s.data() + s.size();
+  long long parsed = 0;
+  auto result = std::from_chars(begin, end, parsed);
+  if (result.ec != std::errc{} || result.ptr != end || parsed <= 0) {
+    return false;
+  }
+  out = static_cast<int64_t>(parsed);
+  return true;
 }
 
 bool read_crlf_line(const std::string &s, size_t &pos, std::string &line) {
@@ -176,29 +197,41 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
       return;
     }
 
-    int64_t expiry_ms = -1;
+    std::optional<int64_t> expiry_at_ms = std::nullopt;
     if (args.size() == 5) {
-      std::string time_variant = args[3];
-      int64_t expiry_arg = stoi(args[4]);
-      if (time_variant == "EX") {
-        expiry_ms = now_ms() + (expiry_arg * 1000);
-      } else if (time_variant == "PX") {
-        expiry_ms = now_ms() + expiry_arg;
+      int64_t ttl = 0;
+      if (!parse_positive_int64(args[4], ttl)) {
+        send_all(client_fd, "-ERR invalid expire time in 'set' command\r\n");
+        return;
+      }
+
+      int64_t ttl_ms = 0;
+      if (iequals(args[3], "EX")) {
+        if (ttl > LLONG_MAX / 1000) {
+          send_all(client_fd, "-ERR invalid expire time in 'set' command\r\n");
+          return;
+        }
+        ttl_ms = ttl * 1000;
+      } else if (iequals(args[3], "PX")) {
+        ttl_ms = ttl;
       } else {
         send_all(client_fd, "-ERR wrong time_variant for 'set' command\r\n");
         return;
       }
+
+      int64_t absolute_expiry = 0;
+      if (!safe_add_int64(now_ms(), ttl_ms, absolute_expiry)) {
+        send_all(client_fd, "-ERR invalid expire time in 'set' command\r\n");
+        return;
+      }
+      expiry_at_ms = absolute_expiry;
     }
 
     {
       std::lock_guard<std::mutex> lock(kv_store_mutex);
       std::string key = args[1];
       std::string value = args[2];
-      if (expiry_ms != -1) {
-        kv_store[key] = Entry{value, expiry_ms};
-      } else {
-        kv_store[key] = Entry{value, std::nullopt};
-      }
+      kv_store[key] = Entry{value, expiry_at_ms};
     }
 
     send_all(client_fd, "+OK\r\n");
@@ -219,11 +252,15 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
       auto it = kv_store.find(key);
       if (it != kv_store.end()) {
         Entry &entry = it->second;
-        if (now_ms() >= entry.expiry_at_ms) {
-          // This entry has expired - remove it - don't set val
-          kv_store.erase(key);
+        if (entry.expiry_at_ms.has_value()) {
+          if (now_ms() >= entry.expiry_at_ms.value()) {
+            // This entry has expired - remove it - don't set val
+            kv_store.erase(key);
+          } else {
+            // Otherwise this entry is still valid
+            val = entry.value;
+          }
         } else {
-          // Otherwise this entry is still valid
           val = entry.value;
         }
       }
