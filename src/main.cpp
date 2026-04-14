@@ -78,6 +78,49 @@ bool parse_int64(const std::string &line, long long &out) {
   return true;
 }
 
+// Signed integer for command args (e.g. LRANGE start/stop: 0, negative indices).
+bool parse_signed_int64(const std::string &s, int64_t &out) {
+  long long parsed = 0;
+  if (!parse_int64(s, parsed)) {
+    return false;
+  }
+  out = static_cast<int64_t>(parsed);
+  return true;
+}
+
+// Redis LRANGE index rules: negative offsets from end, then clamp, then empty
+// if start > end.
+bool lrange_normalized_range(int64_t raw_start, int64_t raw_end, size_t len,
+                             size_t &out_start, size_t &out_end_inclusive) {
+  if (len == 0) {
+    return false;
+  }
+
+  const int64_t n = static_cast<int64_t>(len);
+  int64_t start = raw_start;
+  int64_t end = raw_end;
+
+  if (start < 0) {
+    start += n;
+  }
+  if (end < 0) {
+    end += n;
+  }
+  if (start < 0) {
+    start = 0;
+  }
+  if (end >= n) {
+    end = n - 1;
+  }
+  if (start > end) {
+    return false;
+  }
+
+  out_start = static_cast<size_t>(start);
+  out_end_inclusive = static_cast<size_t>(end);
+  return true;
+}
+
 bool parse_bulk_string(const std::string &s, size_t &pos, std::string &out) {
   if (pos >= s.size() || s[pos] != '$') {
     return false;
@@ -162,6 +205,18 @@ std::string encode_bulk_string(const std::optional<std::string_view> payload) {
 
 std::string encode_integer(int64_t value) {
   return ":" + std::to_string(value) + "\r\n";
+}
+
+[[maybe_unused]] std::string
+encode_array(const std::vector<std::string_view> &elements) {
+  if (elements.empty()) {
+    return "*0\r\n";
+  }
+  std::string out = "*" + std::to_string(elements.size()) + "\r\n";
+  for (const auto &element : elements) {
+    out += encode_bulk_string(element);
+  }
+  return out;
 }
 
 bool iequals(const std::string &a, const std::string &b) {
@@ -303,6 +358,50 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
     }
 
     send_all(client_fd, encode_integer(list_size));
+    return;
+  }
+
+  if (iequals(args[0], "lrange")) {
+    if (args.size() != 4) {
+      send_all(client_fd,
+               "-ERR wrong number of arguments for 'lrange' command\r\n");
+      return;
+    }
+
+    int64_t raw_start = 0;
+    int64_t raw_end = 0;
+    if (!parse_signed_int64(args[2], raw_start) ||
+        !parse_signed_int64(args[3], raw_end)) {
+      send_all(client_fd,
+               "-ERR value is not an integer or out of range\r\n");
+      return;
+    }
+
+    std::vector<std::string_view> sublist;
+    {
+      std::lock_guard<std::mutex> lock(kv_store_mutex);
+      auto list_it = list_store.find(args[1]);
+      if (list_it == list_store.end()) {
+        send_all(client_fd, encode_array({}));
+        return;
+      }
+
+      const std::vector<std::string> &list = list_it->second;
+      size_t start_idx = 0;
+      size_t end_idx = 0;
+      if (!lrange_normalized_range(raw_start, raw_end, list.size(), start_idx,
+                                   end_idx)) {
+        send_all(client_fd, encode_array({}));
+        return;
+      }
+
+      sublist.reserve(end_idx - start_idx + 1);
+      for (size_t i = start_idx; i <= end_idx; ++i) {
+        sublist.push_back(list[i]);
+      }
+    }
+
+    send_all(client_fd, encode_array(sublist));
     return;
   }
 
