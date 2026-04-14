@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cctype>
 #include <charconv>
@@ -208,8 +209,7 @@ std::string encode_integer(int64_t value) {
   return ":" + std::to_string(value) + "\r\n";
 }
 
-[[maybe_unused]] std::string
-encode_array(const std::vector<std::string_view> &elements) {
+std::string encode_array(const std::vector<std::string_view> &elements) {
   if (elements.empty()) {
     return "*0\r\n";
   }
@@ -445,31 +445,64 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
   }
 
   if (iequals(args[0], "lpop")) {
-    if (args.size() < 2) {
+    if (args.size() != 2 && args.size() != 3) {
       send_all(client_fd,
                "-ERR wrong number of arguments for 'lpop' command\r\n");
       return;
     }
 
-    std::optional<std::string> popped;
+    if (args.size() == 2) {
+      std::optional<std::string> popped;
+      {
+        std::lock_guard<std::mutex> lock(kv_store_mutex);
+        auto it = list_store.find(args[1]);
+        if (it != list_store.end() && !it->second.empty()) {
+          popped = std::move(it->second.front());
+          it->second.erase(it->second.begin());
+          if (it->second.empty()) {
+            list_store.erase(it);
+          }
+        }
+      }
+
+      if (!popped.has_value()) {
+        send_all(client_fd, encode_bulk_string(std::nullopt));
+      } else {
+        send_all(client_fd,
+                 encode_bulk_string(std::optional<std::string_view>(*popped)));
+      }
+      return;
+    }
+
+    int64_t count = 0;
+    if (!parse_signed_int64(args[2], count)) {
+      send_all(client_fd, "-ERR value is not an integer or out of range\r\n");
+      return;
+    }
+    if (count < 0) {
+      send_all(client_fd, "-ERR value is out of range\r\n");
+      return;
+    }
+
+    std::vector<std::string_view> removed;
     {
       std::lock_guard<std::mutex> lock(kv_store_mutex);
       auto it = list_store.find(args[1]);
       if (it != list_store.end() && !it->second.empty()) {
-        popped = std::move(it->second.front());
-        it->second.erase(it->second.begin());
-        if (it->second.empty()) {
+        auto &lst = it->second;
+        const size_t take = std::min(static_cast<size_t>(count), lst.size());
+        removed.reserve(take);
+        for (size_t i = 0; i < take; ++i) {
+          removed.push_back(std::move(lst.front()));
+          lst.erase(lst.begin());
+        }
+        if (lst.empty()) {
           list_store.erase(it);
         }
       }
     }
 
-    if (!popped.has_value()) {
-      send_all(client_fd, encode_bulk_string(std::nullopt));
-    } else {
-      send_all(client_fd,
-               encode_bulk_string(std::optional<std::string_view>(*popped)));
-    }
+    send_all(client_fd, encode_array(removed));
     return;
   }
 
