@@ -484,7 +484,9 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
       return;
     }
 
-    std::vector<std::string_view> removed;
+    // Own popped strings here — do not store string_views into lst while
+    // erasing; erase destroys the std::string objects the views would point at.
+    std::vector<std::string> removed;
     {
       std::lock_guard<std::mutex> lock(kv_store_mutex);
       auto it = list_store.find(args[1]);
@@ -502,7 +504,12 @@ void dispatch_command(int client_fd, const std::vector<std::string> &args) {
       }
     }
 
-    send_all(client_fd, encode_array(removed));
+    std::vector<std::string_view> views;
+    views.reserve(removed.size());
+    for (const auto &s : removed) {
+      views.push_back(s);
+    }
+    send_all(client_fd, encode_array(views));
     return;
   }
 
